@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         MUSE – Hộp thoại xác nhận công ca
 // @namespace    https://github.com/nnnluv7/autoclick
-// @version      1.0.0
-// @description  Hiển thị câu hỏi xác nhận công ca của Insite bằng nút OK và Hủy ngay trên trang.
+// @version      1.1.0
+// @description  Tự trả lời OK cho câu hỏi công ca trong lượt bấm Xác nhận công của Insite.
 // @match        https://newinsite.thegioididong.com/*
+// @updateURL    https://raw.githubusercontent.com/nnnluv7/autoclick/main/muse-xac-nhan-cong.user.js
+// @downloadURL  https://raw.githubusercontent.com/nnnluv7/autoclick/main/muse-xac-nhan-cong.user.js
 // @run-at       document-start
 // @sandbox      raw
 // @grant        none
@@ -13,19 +15,23 @@
 (() => {
   'use strict';
 
+  if (window.top !== window.self) return;
+
   const origin = 'https://newinsite.thegioididong.com';
-  const path = /^\/office\/xac-nhan-congca\/?$/;
-  const question = /^bạn có đồng ý (?:xác )?nhận chấm công\s*[,;.:]?\s*số ca sẽ xác nhận\s*:?\s*\d+\s*[?!.]?$/iu;
+  const attendancePath = /^\/office\/xac-nhan-congca\/?$/;
   const actionName = /^xác nhận (?:chấm )?công(?: ca)?$/iu;
+  const question = /^bạn có đồng ý (?:xác )?nhận chấm công\s*[,;.:]?\s*số ca sẽ xác nhận\s*:?\s*(\d+)\s*[?!.]?$/iu;
   const clickable = 'button, a, input[type="button"], input[type="submit"], [role="button"], [onclick], [ng-click], [data-ng-click], .btn';
   const nativeConfirm = window.confirm;
-  const timeoutMs = 30000;
-  let attempt = null;
-  let nextClick = null;
-  let view = null;
+  const waitMs = 30000;
+  const doubleClickMs = 1000;
+  const ready = 'Tự OK khi bấm Xác nhận công';
+  let active = null;
+  let status = null;
+  let pageUrl = location.href;
 
   function onAttendancePage() {
-    return location.origin === origin && path.test(location.pathname);
+    return location.origin === origin && attendancePath.test(location.pathname);
   }
 
   function normalize(text) {
@@ -34,199 +40,113 @@
 
   function isAction(element) {
     if (!(element instanceof HTMLElement) || !element.matches(clickable)) return false;
+    if (element.matches(':disabled') || element.closest('[hidden], [inert], [aria-disabled="true"]')) return false;
     const label = element instanceof HTMLInputElement ? element.value : element.textContent;
     return [label, element.getAttribute('aria-label'), element.title]
       .some(value => actionName.test(normalize(value)));
   }
 
-  // Watch for edits while the question is visible without copying employee data.
-  function watchSelection() {
-    const grids = [...document.querySelectorAll('tbody, [role="rowgroup"]')];
-    let edited = false;
-    const markEdited = () => { edited = true; };
-    const observer = new MutationObserver(markEdited);
-    for (const grid of grids) {
-      observer.observe(grid, { subtree: true, childList: true, characterData: true });
+  function showStatus(message) {
+    if (!document.body || !onAttendancePage()) return;
+    if (!status?.isConnected) {
+      status = document.createElement('div');
+      status.id = 'muse-cong-status';
+      status.lang = 'vi';
+      status.setAttribute('role', 'status');
+      status.setAttribute('aria-live', 'polite');
+      status.setAttribute('aria-atomic', 'true');
+      status.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:9999;max-width:min(420px,86vw);box-sizing:border-box;padding:7px 12px;border-radius:8px;background:#172b41;color:white;font:500 14px/1.4 system-ui,sans-serif;box-shadow:0 2px 10px #172b4133;pointer-events:none';
+      document.body.append(status);
     }
-    document.addEventListener('input', markEdited, true);
-    document.addEventListener('change', markEdited, true);
-    return {
-      fresh() {
-        if (observer.takeRecords().length || grids.some(grid => !grid.isConnected)) edited = true;
-        return !edited;
-      },
-      stop() {
-        observer.disconnect();
-        document.removeEventListener('input', markEdited, true);
-        document.removeEventListener('change', markEdited, true);
-      }
-    };
+    if (status.textContent !== message) status.textContent = message;
   }
 
-  function forgetAttempt() {
-    if (!attempt) return;
-    clearTimeout(attempt.timer);
-    attempt.approval?.selection.stop();
-    attempt = null;
+  function clearAttempt() {
+    if (active) clearTimeout(active.timer);
+    active = null;
   }
 
-  function closeView() {
-    if (!view) return;
-    const { dialog, selection } = view;
-    view = null;
-    selection.stop();
-    if (dialog.open) dialog.close();
-    dialog.remove();
+  function resetPage() {
+    clearAttempt();
+    status?.remove();
+    status = null;
+    pageUrl = '';
   }
 
-  function reset() {
-    nextClick = null;
-    forgetAttempt();
-    closeView();
-  }
-
-  function showQuestion(message, action) {
-    const dialog = document.createElement('dialog');
-    dialog.id = 'muse-cong-dialog';
-    dialog.lang = 'vi';
-    dialog.setAttribute('aria-labelledby', 'muse-cong-title');
-    dialog.setAttribute('aria-describedby', 'muse-cong-message');
-    dialog.style.cssText = 'box-sizing:border-box;width:min(460px,92vw);max-height:90vh;margin:auto;padding:24px;border:1px solid #b8c3cf;border-radius:14px;background:white;color:#172333;font:16px/1.5 system-ui,sans-serif;box-shadow:0 12px 48px #14263840';
-
-    const title = document.createElement('h2');
-    title.id = 'muse-cong-title';
-    title.textContent = 'Xác nhận công ca';
-    title.style.cssText = 'font:600 20px/1.3 system-ui,sans-serif;margin:0 0 12px;color:inherit';
-    const body = document.createElement('p');
-    body.id = 'muse-cong-message';
-    body.textContent = message;
-    body.style.cssText = 'margin:0 0 22px;white-space:pre-wrap;color:inherit';
-    const actions = document.createElement('div');
-    actions.style.cssText = 'display:flex;justify-content:flex-end;gap:10px';
-    const cancel = document.createElement('button');
-    const ok = document.createElement('button');
-    for (const button of [cancel, ok]) {
-      button.type = 'button';
-      button.style.cssText = 'min-width:80px;padding:8px 16px;border:1px solid #aab7c4;border-radius:8px;background:#fff;color:#172333;font:600 16px/1.4 system-ui,sans-serif;cursor:pointer';
+  function syncPage() {
+    if (pageUrl !== location.href) {
+      resetPage();
+      pageUrl = location.href;
     }
-    cancel.id = 'muse-cong-cancel';
-    cancel.textContent = 'Hủy';
-    cancel.autofocus = true;
-    ok.id = 'muse-cong-ok';
-    ok.textContent = 'OK';
-    ok.style.background = '#125bb7';
-    ok.style.color = '#fff';
-    actions.append(cancel, ok);
-    dialog.append(title, body, actions);
-    document.body.append(dialog);
+    if (!status?.isConnected) showStatus(ready);
+  }
 
-    const selection = watchSelection();
-    view = { dialog, selection, url: action.url };
-    cancel.addEventListener('click', reset);
-    dialog.addEventListener('cancel', event => {
-      event.preventDefault();
-      reset();
-    });
-    dialog.addEventListener('close', () => {
-      if (view?.dialog === dialog) reset();
-    });
-    ok.addEventListener('click', () => {
-      if (view?.dialog !== dialog || !dialog.open || ok.disabled) return;
-      ok.disabled = true;
-      const { button, url } = action;
-      if (url !== location.href || !onAttendancePage() || !button.isConnected ||
-          !isAction(button) || button.matches(':disabled, [aria-disabled="true"]')) {
-        body.textContent = 'Trang đã cập nhật. Đóng hộp thoại rồi bấm lại nút Xác nhận công trên danh sách hiện tại.';
-        ok.hidden = true;
-        cancel.textContent = 'Đóng';
-        cancel.focus();
-        return;
-      }
-      const unchanged = selection.fresh();
-      closeView();
-      forgetAttempt();
-      const approval = unchanged ? {
-        message: normalize(message),
-        synchronous: action.synchronous,
-        selection: watchSelection()
-      } : null;
-      nextClick = { button, approval };
-      // Re-enter the original handler. Only its matching confirmation may succeed once.
-      try {
-        button.click();
-      } finally {
-        if (nextClick) approval?.selection.stop();
-        nextClick = null;
-      }
-    });
-    dialog.showModal();
-    cancel.focus();
+  function expire(attempt) {
+    if (active !== attempt) return;
+    clearAttempt();
+    if (attempt.answeredAt === null && attempt.url === location.href) {
+      showStatus('Insite chưa hiện câu hỏi xác nhận công trong 30 giây.');
+    }
   }
 
   window.addEventListener('click', event => {
     if (!onAttendancePage()) return;
-    const chain = event.composedPath();
-    if (view && chain.includes(view.dialog)) return;
-    const button = chain.find(isAction);
+    const button = event.composedPath().find(isAction);
     if (!button) {
-      forgetAttempt();
+      clearAttempt();
       return;
     }
-    // Serialize duplicate clicks while the site is preparing the same question.
-    if (view || (!nextClick && attempt?.button === button && !attempt.handled)) {
+    const now = performance.now();
+    if (active && active.url === location.href && now <= active.deadline &&
+        (active.answeredAt === null || now - active.answeredAt < doubleClickMs)) {
       event.preventDefault();
       event.stopImmediatePropagation();
       return;
     }
-    forgetAttempt();
-    const approval = nextClick?.button === button ? nextClick.approval : null;
-    nextClick = null;
-    attempt = { button, url: location.href, approval, event, handled: false, timer: setTimeout(forgetAttempt, timeoutMs) };
+    clearAttempt();
+    const attempt = { url: location.href, click: event, deadline: now + waitMs, answeredAt: null };
+    active = attempt;
+    attempt.timer = setTimeout(() => expire(attempt), waitMs);
+    showStatus('Đã bấm Xác nhận công. Đang chờ câu hỏi của Insite…');
   }, true);
 
-  // window.confirm must return a boolean synchronously. The first pass cancels;
-  // the in-page OK replays the site action and releases only the reviewed question.
+  // Answer the original site handler synchronously. Never replay its click:
+  // cancellation and replay could otherwise discard unsaved form selections.
   window.confirm = function (message) {
-    const key = typeof message === 'string' ? normalize(message) : '';
-    if (!onAttendancePage() || !question.test(key)) return Reflect.apply(nativeConfirm, window, arguments);
-    if (view?.url === location.href) return false;
-    if (!attempt || attempt.url !== location.href || !attempt.button.isConnected ||
-        !document.body || typeof HTMLDialogElement === 'undefined') {
+    if (!onAttendancePage() || !active || active.url !== location.href || typeof message !== 'string') {
       return Reflect.apply(nativeConfirm, window, arguments);
     }
-    if (attempt.handled) return false;
-    attempt.handled = true;
-    attempt.synchronous = attempt.event.eventPhase !== Event.NONE;
-    const approval = attempt.approval;
-    if (approval) {
-      const matches = approval.message === key && (!approval.synchronous || attempt.synchronous) &&
-        approval.selection.fresh();
-      approval.selection.stop();
-      attempt.approval = null;
-      if (matches) return true;
-    }
-    try {
-      showQuestion(message, attempt);
-    } catch {
-      reset();
+    const match = question.exec(normalize(message));
+    if (!match) return Reflect.apply(nativeConfirm, window, arguments);
+    const now = performance.now();
+    if (now > active.deadline) {
+      expire(active);
       return Reflect.apply(nativeConfirm, window, arguments);
     }
-    return false;
+    if (active.answeredAt !== null) return false;
+    active.answeredAt = now;
+    showStatus('Đã bấm OK cho ' + match[1] + ' ca. Xem kết quả từ Insite.');
+    return true;
   };
 
-  // Release an unfinished attempt after edits or navigation. Chrome's Navigation
-  // API also covers same-document route changes from the portal's own menu.
-  function afterEdit() {
-    if (!view && attempt && !attempt.handled && !attempt.approval) forgetAttempt();
+  function onEdit(event) {
+    // The site's own synchronous form normalization is part of the same action.
+    if (active?.click && active.click.eventPhase !== Event.NONE) return;
+    if (active?.answeredAt != null && !event.isTrusted) return;
+    clearAttempt();
+    if (onAttendancePage()) showStatus(ready);
   }
-  window.addEventListener('input', afterEdit, true);
-  window.addEventListener('change', afterEdit, true);
-  function afterNavigation() {
-    const previousUrl = view?.url ?? attempt?.url;
-    if (previousUrl && previousUrl !== location.href) reset();
+
+  window.addEventListener('input', onEdit, true);
+  window.addEventListener('change', onEdit, true);
+  window.addEventListener('pagehide', resetPage);
+  window.addEventListener('pageshow', syncPage);
+  window.addEventListener('popstate', syncPage);
+  window.addEventListener('hashchange', syncPage);
+  window.navigation?.addEventListener('currententrychange', syncPage);
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', syncPage, { once: true });
+  } else {
+    syncPage();
   }
-  window.addEventListener('pagehide', reset);
-  window.addEventListener('popstate', afterNavigation);
-  window.addEventListener('hashchange', afterNavigation);
-  window.navigation?.addEventListener('currententrychange', afterNavigation);
 })();
